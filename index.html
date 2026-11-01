@@ -1,0 +1,258 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Переговорные комнаты</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; background: #f6f7f8; color: #222; font: 16px/1.5 Arial, sans-serif; }
+    main { max-width: 1000px; margin: 32px auto; padding: 0 20px; }
+    h1 { margin: 0; font-size: 26px; } h2 { margin: 0 0 16px; font-size: 20px; }
+    header, nav, .row { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+    header { justify-content: space-between; margin-bottom: 24px; }
+    section { background: white; border: 1px solid #ddd; border-radius: 6px; padding: 24px; margin: 16px 0; }
+    #login-section { max-width: 430px; }
+    label { display: block; margin-bottom: 12px; }
+    input { display: block; padding: 9px 10px; border: 1px solid #aaa; border-radius: 4px; font: inherit; width: 100%; }
+    input[aria-invalid="true"] { border-color: #a31818; }
+    button { padding: 9px 15px; font: inherit; border: 1px solid #315d87; border-radius: 4px; background: #315d87; color: white; cursor: pointer; }
+    button.secondary { background: white; color: #315d87; }
+    button:disabled { opacity: .55; cursor: wait; }
+    .muted { color: #666; font-size: 14px; } .error { color: #a31818; font-size: 14px; min-height: 20px; display: block; }
+    #message { padding: 12px 16px; border: 1px solid #b8cbb8; background: #eef7ee; border-radius: 4px; }
+    #message.bad { border-color: #e4baba; background: #fff1f1; color: #8c1717; }
+    table { width: 100%; border-collapse: collapse; margin-top: 16px; }
+    th, td { text-align: left; border-bottom: 1px solid #ddd; padding: 12px 8px; vertical-align: middle; }
+    .table-wrap { overflow-x: auto; } .room { display: flex; justify-content: space-between; align-items: center; gap: 16px; border-top: 1px solid #ddd; padding: 14px 0; }
+    [hidden] { display: none !important; }
+    @media (max-width: 600px) { main { margin: 20px auto; padding: 0 12px; } section { padding: 16px; } .row label { width: 100%; } }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Переговорные комнаты</h1>
+    <div id="account" hidden><span id="user-name"></span> <button type="button" class="secondary" id="logout">Выйти</button></div>
+  </header>
+  <p id="message" role="status" aria-live="polite" hidden></p>
+  <section id="login-section">
+    <h2>Вход</h2>
+    <form id="login-form" novalidate>
+      <label>Электронная почта<input id="email" type="email" autocomplete="username" required aria-describedby="email-error"><span id="email-error" class="error"></span></label>
+      <label>Пароль<input id="password" type="password" autocomplete="current-password" required aria-describedby="password-error"><span id="password-error" class="error"></span></label>
+      <button>Войти</button>
+    </form>
+  </section>
+  <div id="workspace" hidden>
+    <nav><button type="button" id="show-search">Создать бронь</button><button type="button" class="secondary" id="show-bookings">Мои брони</button></nav>
+    <section id="search-section">
+      <h2>Найти свободную комнату</h2>
+      <form id="search-form" novalidate>
+        <div class="row">
+          <label>Дата начала<input id="date" placeholder="ДД.ММ.ГГГГ" inputmode="numeric" aria-describedby="date-error"><span id="date-error" class="error"></span></label>
+          <label>Начало, ЧЧ:ММ<input id="start" placeholder="10:00" inputmode="numeric" aria-describedby="start-error"><span id="start-error" class="error"></span></label>
+          <label>Дата окончания<input id="end-date" placeholder="ДД.ММ.ГГГГ" inputmode="numeric" aria-describedby="end-date-error"><span id="end-date-error" class="error"></span></label>
+          <label>Окончание, ЧЧ:ММ<input id="end" placeholder="11:00" inputmode="numeric" aria-describedby="end-error"><span id="end-error" class="error"></span></label>
+        </div>
+        <button>Найти</button>
+      </form>
+      <p id="search-summary" class="muted"></p>
+      <div id="rooms"></div>
+    </section>
+    <section id="bookings-section" hidden>
+      <div class="row"><h2>Мои брони</h2><button type="button" class="secondary" id="refresh-bookings">Обновить</button></div>
+      <div id="bookings-content"></div>
+    </section>
+  </div>
+</main>
+<script>
+  const $ = id => document.getElementById(id);
+  const dateFormat = new Intl.DateTimeFormat('ru-RU', {timeZone: 'Asia/Yekaterinburg', day: '2-digit', month: '2-digit', year: 'numeric'});
+  const timeFormat = new Intl.DateTimeFormat('ru-RU', {timeZone: 'Asia/Yekaterinburg', hour: '2-digit', minute: '2-digit', hourCycle: 'h23'});
+  let busy = false;
+
+  function message(text, bad = false) {
+    $('message').textContent = text;
+    $('message').className = bad ? 'bad' : '';
+    $('message').hidden = !text;
+  }
+  function clearErrors() {
+    for (const el of document.querySelectorAll('.error')) el.textContent = '';
+    for (const el of document.querySelectorAll('[aria-invalid]')) el.removeAttribute('aria-invalid');
+  }
+  function fieldError(id, text) {
+    $(id + '-error').textContent = text;
+    $(id).setAttribute('aria-invalid', 'true');
+  }
+  function report(error) {
+    const names = {email: 'email', password: 'password', starts_at: 'start', ends_at: 'end'};
+    for (const [field, text] of Object.entries(error.fields || {})) if (names[field]) fieldError(names[field], text);
+    message(error.message, true);
+  }
+  function showLogin() {
+    $('login-section').hidden = false;
+    $('workspace').hidden = true;
+    $('account').hidden = true;
+    $('rooms').replaceChildren();
+    $('bookings-content').replaceChildren();
+  }
+  function showWorkspace(user) {
+    $('user-name').textContent = user.name;
+    $('login-section').hidden = true;
+    $('workspace').hidden = false;
+    $('account').hidden = false;
+    $('password').value = '';
+    showSection('search');
+  }
+  function showSection(name) {
+    $('search-section').hidden = name !== 'search';
+    $('bookings-section').hidden = name !== 'bookings';
+  }
+  async function api(path, body) {
+    const options = {credentials: 'same-origin', headers: {Accept: 'application/json'}};
+    if (body !== undefined) {
+      options.method = 'POST';
+      options.headers['Content-Type'] = 'application/json';
+      options.body = JSON.stringify(body);
+    }
+    let response;
+    try { response = await fetch('/api' + path, options); }
+    catch { throw new Error('Не удалось связаться с сервером. Повторите попытку.'); }
+    let data;
+    try { data = await response.json(); }
+    catch { throw new Error('Сервер вернул некорректный ответ. Повторите попытку.'); }
+    if (!response.ok) {
+      if (response.status === 401 && path !== '/login') showLogin();
+      const error = new Error(data.error || 'Не удалось выполнить действие.');
+      error.status = response.status; error.fields = data.fields;
+      throw error;
+    }
+    return data;
+  }
+  async function action(fn) {
+    if (busy) return;
+    busy = true;
+    for (const control of document.querySelectorAll('button, input')) control.disabled = true;
+    try { await fn(); } catch (error) { report(error); }
+    finally {
+      busy = false;
+      for (const control of document.querySelectorAll('button, input')) control.disabled = false;
+    }
+  }
+  function parseInterval() {
+    clearErrors();
+    function parseTime(id, dateID) {
+      const match = /^(\d{2})\.(\d{2})\.(\d{4})$/.exec($(dateID).value.trim());
+      if (!match) { fieldError(dateID, 'Введите дату в формате ДД.ММ.ГГГГ.'); return null; }
+      const [, dd, mm, yyyy] = match;
+      const m = /^([01]\d|2[0-3]):([0-5]\d)$/.exec($(id).value.trim());
+      if (!m) { fieldError(id, 'Введите время в формате ЧЧ:ММ.'); return null; }
+      const text = `${yyyy}-${mm}-${dd}T${m[1]}:${m[2]}:00+05:00`;
+      const parsed = new Date(text);
+      const local = new Date(parsed.getTime() + 5 * 3600000);
+      if (isNaN(parsed) || local.getUTCFullYear() !== Number(yyyy) || local.getUTCMonth() + 1 !== Number(mm) || local.getUTCDate() !== Number(dd)) {
+        fieldError(dateID, 'Такой даты не существует.'); return null;
+      }
+      return text;
+    }
+    const starts_at = parseTime('start', 'date'), ends_at = parseTime('end', 'end-date');
+    if (!starts_at || !ends_at) return null;
+    const duration = new Date(ends_at) - new Date(starts_at);
+    if (duration < 1800000 || duration > 14400000) { fieldError('end', 'Длительность от 30 минут до 4 часов.'); return null; }
+    return {starts_at, ends_at};
+  }
+  function element(tag, text) { const el = document.createElement(tag); el.textContent = text; return el; }
+  function describe(b) {
+    const start = new Date(b.starts_at), end = new Date(b.ends_at);
+    return `${b.room_name}, ${dateFormat.format(start)} ${timeFormat.format(start)} - ${dateFormat.format(end)} ${timeFormat.format(end)}`;
+  }
+  async function searchRooms() {
+    const selected = parseInterval();
+    if (!selected) return;
+    $('rooms').replaceChildren();
+    $('search-summary').textContent = '';
+    const rooms = await api('/rooms?' + new URLSearchParams(selected));
+    $('search-summary').textContent = rooms.length ? 'Выберите комнату для бронирования.' : 'Свободных комнат нет. Измените время встречи.';
+    for (const room of rooms) {
+      const row = element('div', ''); row.className = 'room';
+      row.append(element('span', `${room.name}, вместимость: ${room.capacity} чел.`));
+      const button = element('button', 'Забронировать'); button.type = 'button';
+      button.onclick = () => action(async () => {
+        clearErrors(); message('');
+        try {
+          const booking = await api('/bookings', {room_id: room.id, ...selected});
+          message(`Бронь №${booking.id} создана. ${describe(booking)}. Статус: Активна.`);
+          await searchRooms().catch(error => { error.message = `Бронь №${booking.id} сохранена. Список комнат не обновлён: ${error.message}`; throw error; });
+        } catch (error) {
+          if (error.status === 409) {
+            await searchRooms().catch(refreshError => { error.message += '. ' + refreshError.message; });
+          }
+          throw error;
+        }
+      });
+      row.append(button); $('rooms').append(row);
+    }
+  }
+  async function loadBookings() {
+    showSection('bookings');
+    $('bookings-content').replaceChildren(element('p', 'Загрузка...'));
+    let bookings;
+    try { bookings = await api('/bookings'); }
+    catch (error) { $('bookings-content').replaceChildren(); throw error; }
+    $('bookings-content').replaceChildren();
+    if (!bookings.length) {
+      $('bookings-content').append(element('p', 'Броней пока нет.'));
+      const button = element('button', 'Создать бронь'); button.onclick = () => showSection('search');
+      $('bookings-content').append(button); return;
+    }
+    const wrap = element('div', ''); wrap.className = 'table-wrap';
+    const table = element('table', '');
+    const head = element('tr', '');
+    for (const text of ['Номер', 'Комната', 'Начало', 'Окончание', 'Статус', 'Действие']) head.append(element('th', text));
+    const thead = element('thead', ''); thead.append(head); table.append(thead);
+    const tbody = element('tbody', '');
+    for (const b of bookings) {
+      const row = element('tr', '');
+      const format = value => `${dateFormat.format(new Date(value))} ${timeFormat.format(new Date(value))}`;
+      for (const text of [b.id, b.room_name, format(b.starts_at), format(b.ends_at), b.status === 'Active' ? 'Активна' : 'Отменена']) row.append(element('td', String(text)));
+      const cell = element('td', '');
+      if (b.can_cancel) {
+        const button = element('button', 'Отменить'); button.className = 'secondary';
+        button.onclick = () => action(async () => {
+          if (!confirm(`Отменить бронь №${b.id}?\n${describe(b)}`)) return;
+          message('');
+          try { await api(`/bookings/${b.id}/cancel`, {}); message(`Бронь №${b.id} отменена.`); }
+          catch (error) { if (error.status === 409) await loadBookings(); throw error; }
+          $('rooms').replaceChildren(); await loadBookings();
+        });
+        cell.append(button);
+      }
+      row.append(cell); tbody.append(row);
+    }
+    table.append(tbody); wrap.append(table); $('bookings-content').append(wrap);
+  }
+  $('login-form').onsubmit = event => {
+    event.preventDefault(); action(async () => {
+      clearErrors(); message('');
+      const user = await api('/login', {email: $('email').value, password: $('password').value});
+      showWorkspace(user);
+    });
+  };
+  $('logout').onclick = () => action(async () => { await api('/logout', {}); showLogin(); message('Вы вышли из системы.'); });
+  $('show-search').onclick = () => { message(''); showSection('search'); };
+  $('show-bookings').onclick = () => action(async () => { message(''); await loadBookings(); });
+  $('refresh-bookings').onclick = () => action(async () => { message(''); await loadBookings(); });
+  $('search-form').onsubmit = event => { event.preventDefault(); action(async () => { message(''); await searchRooms(); }); };
+  for (const id of ['date', 'start', 'end-date', 'end']) $(id).oninput = () => { $('rooms').replaceChildren(); $('search-summary').textContent = ''; };
+  const next = new Date(Date.now() + 3600000); next.setUTCSeconds(0, 0);
+  const finish = new Date(next.getTime() + 3600000);
+  $('date').value = dateFormat.format(next); $('start').value = timeFormat.format(next);
+  $('end-date').value = dateFormat.format(finish); $('end').value = timeFormat.format(finish);
+  action(async () => {
+    try { showWorkspace(await api('/me')); }
+    catch (error) { showLogin(); if (error.status !== 401) throw error; }
+  });
+</script>
+</body>
+</html>
