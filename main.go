@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -22,8 +23,25 @@ import (
 //go:embed index.html migrations/*.sql
 var files embed.FS
 
+type store interface {
+	Ping(context.Context) error
+	UserByEmail(context.Context, string) (User, string, error)
+	SessionUser(context.Context, string) (User, error)
+	StartSession(context.Context, string, string, int64, time.Time) error
+	EndSession(context.Context, string) error
+	Rooms(context.Context, time.Time, time.Time) ([]Room, error)
+	Bookings(context.Context, int64) ([]Booking, error)
+	CreateBooking(context.Context, int64, int64, time.Time, time.Time) (Booking, error)
+	CancelBooking(context.Context, int64, int64) (Booking, error)
+}
+
 type app struct {
-	db *pgxpool.Pool
+	db  store
+	now func() time.Time
+}
+
+func newApp(db store, now func() time.Time) *app {
+	return &app{db: db, now: now}
 }
 
 type contextKey int
@@ -40,16 +58,17 @@ type apiError struct {
 
 func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
-	if err := run(); err != nil {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	dsn := env("DATABASE_URL", "postgres://conference:conference@localhost:5432/conference?sslmode=disable")
+	if err := run(ctx, dsn, env("LISTEN_ADDR", ":8080")); err != nil {
 		slog.Error("server", "result", "failed", "error", err.Error())
 		os.Exit(1)
 	}
 }
 
-func run() error {
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-	cfg, err := pgxpool.ParseConfig(env("DATABASE_URL", "postgres://conference:conference@localhost:5432/conference?sslmode=disable"))
+func run(ctx context.Context, dsn, address string) error {
+	cfg, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
 		return errors.New("некорректный DATABASE_URL")
 	}
@@ -69,17 +88,25 @@ func run() error {
 	if err = migrate(startupCtx, db); err != nil {
 		return err
 	}
-	a := &app{db: db}
+	cancel()
+	listener, err := net.Listen("tcp", address)
+	if err != nil {
+		return err
+	}
+	return serve(ctx, listener, newApp(postgresStore{db}, time.Now).routes())
+}
+
+func serve(ctx context.Context, listener net.Listener, handler http.Handler) error {
 	srv := &http.Server{
-		Addr: env("LISTEN_ADDR", ":8080"), Handler: a.routes(),
+		Handler:           handler,
 		ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second,
 		WriteTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second,
 	}
 	done := make(chan error, 1)
-	go func() { done <- srv.ListenAndServe() }()
-	slog.Info("server", "result", "started", "address", srv.Addr)
+	go func() { done <- srv.Serve(listener) }()
+	slog.Info("server", "result", "started", "address", listener.Addr().String())
 	select {
-	case err = <-done:
+	case err := <-done:
 		if !errors.Is(err, http.ErrServerClosed) {
 			return err
 		}
@@ -167,7 +194,6 @@ func audit(r *http.Request, operation, result string) {
 }
 
 func (a *app) dbError(w http.ResponseWriter, r *http.Request, err error) {
-	// Не выводим текст ошибки драйвера: он может содержать параметры SQL.
 	slog.Error("database", "request_id", r.Context().Value(requestIDKey), "operation", "database", "result", "failed", "type", errorCode(err))
 	fail(w, http.StatusServiceUnavailable, "База данных недоступна. Повторите попытку позже.")
 }

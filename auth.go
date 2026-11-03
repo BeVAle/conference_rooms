@@ -12,7 +12,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jackc/pgx/v5"
 	"golang.org/x/crypto/argon2"
 )
 
@@ -76,40 +75,23 @@ func (a *app) login(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, apiError{Error: "Проверьте поля.", Fields: fields})
 		return
 	}
-	var user User
-	var hash string
-	err := a.db.QueryRow(r.Context(), "SELECT id, name, email, password_hash FROM users WHERE email=$1", input.Email).Scan(&user.ID, &user.Name, &user.Email, &hash)
-	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+	user, hash, err := a.db.UserByEmail(r.Context(), input.Email)
+	if err != nil && !errors.Is(err, errNotFound) {
 		a.dbError(w, r, err)
 		return
 	}
-	if errors.Is(err, pgx.ErrNoRows) || !verifyPassword(input.Password, hash) {
+	if errors.Is(err, errNotFound) || !verifyPassword(input.Password, hash) {
 		audit(r, "login", "invalid_credentials")
 		fail(w, http.StatusUnauthorized, "Почта или пароль неверны.")
 		return
 	}
 	token := rand.Text() + rand.Text()
-	expires := time.Now().Add(8 * time.Hour)
-	tx, err := a.db.Begin(r.Context())
-	if err != nil {
-		a.dbError(w, r, err)
-		return
+	expires := a.now().Add(8 * time.Hour)
+	var oldHash string
+	if old, err := r.Cookie(sessionCookie); err == nil {
+		oldHash = tokenHash(old.Value)
 	}
-	defer tx.Rollback(r.Context())
-	// При повторном входе текущая сессия также завершается.
-	if old, cookieErr := r.Cookie(sessionCookie); cookieErr == nil {
-		if _, err = tx.Exec(r.Context(), "DELETE FROM sessions WHERE token_hash=$1", tokenHash(old.Value)); err != nil {
-			a.dbError(w, r, err)
-			return
-		}
-	}
-	if _, err = tx.Exec(r.Context(), "DELETE FROM sessions WHERE expires_at <= now()"); err == nil {
-		_, err = tx.Exec(r.Context(), "INSERT INTO sessions(token_hash,user_id,expires_at) VALUES ($1,$2,$3)", tokenHash(token), user.ID, expires)
-	}
-	if err == nil {
-		err = tx.Commit(r.Context())
-	}
-	if err != nil {
+	if err := a.db.StartSession(r.Context(), oldHash, tokenHash(token), user.ID, expires); err != nil {
 		a.dbError(w, r, err)
 		return
 	}
@@ -126,10 +108,8 @@ func (a *app) authorize(next http.HandlerFunc) http.HandlerFunc {
 			fail(w, http.StatusUnauthorized, "Войдите в систему.")
 			return
 		}
-		var user User
-		err = a.db.QueryRow(r.Context(), `SELECT u.id,u.name,u.email FROM sessions s JOIN users u ON u.id=s.user_id
-			WHERE s.token_hash=$1 AND s.expires_at>clock_timestamp()`, tokenHash(c.Value)).Scan(&user.ID, &user.Name, &user.Email)
-		if errors.Is(err, pgx.ErrNoRows) {
+		user, err := a.db.SessionUser(r.Context(), tokenHash(c.Value))
+		if errors.Is(err, errNotFound) {
 			clearCookie(w)
 			fail(w, http.StatusUnauthorized, "Сессия истекла. Войдите снова.")
 			return
@@ -148,7 +128,7 @@ func (a *app) me(w http.ResponseWriter, r *http.Request) {
 
 func (a *app) logout(w http.ResponseWriter, r *http.Request) {
 	if c, err := r.Cookie(sessionCookie); err == nil {
-		if _, err = a.db.Exec(r.Context(), "DELETE FROM sessions WHERE token_hash=$1", tokenHash(c.Value)); err != nil {
+		if err := a.db.EndSession(r.Context(), tokenHash(c.Value)); err != nil {
 			a.dbError(w, r, err)
 			return
 		}
